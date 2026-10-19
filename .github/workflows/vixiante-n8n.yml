@@ -1,83 +1,254 @@
-name: Vixiante n8n (auto-reinicio)
+// DESCARGA 24h + FILTRO (PLACSP) NUN SO NODO — LE DOUS FEEDS:
+//   1) Nacional (perfis aloxados en PLACSP)
+//   2) Agregadas (Euskadi, Cataluña, Madrid, Navarra, La Rioja...)
+// Paxina o feed ATOM seguindo rel="next" ata cubrir as ultimas 24 horas.
+// Por cada paxina aplica XA o filtro e queda so cos campos pequenos:
+// NON acumula XML, asi que nunca se moven decenas de MB entre nodos.
+// Se non consegue baixar NADA (fallo do servidor da PLACSP), lanza un erro
+// visible en vez de devolver unha lista baleira en silencio.
 
-# Comproba cada 5 min se o n8n responde. Se dá erro de servidor (5xx) ou non responde,
-# reinicia os servizos Primary e Worker en Railway (API), sen intervencion manual.
-on:
-  schedule:
-    - cron: "*/5 * * * *"     # cada 5 minutos (GitHub pode atrasarse algo; é normal)
-  workflow_dispatch: {}         # tamén se pode lanzar a man desde a pestana "Actions"
+const URL_NACIONAL = "https://contrataciondelestado.es/sindicacion/sindicacion_643/licitacionesPerfilesContratanteCompleto3.atom";
+const URL_AGREGADAS = "https://contrataciondelsectorpublico.gob.es/sindicacion/sindicacion_1044/PlataformasAgregadasSinMenores.atom";
+const MAX_PAXINAS = 30;
+const HORAS_VENTA = 24;   // xanela de 24h (combinacion probada durante un mes; sen memoria estatal, non hai solape nin duplicados entre dias).
+const PAUSA_MS = 150;
+const MAX_MS_DESCARGA = 600000;   // TEITO de tempo total de descarga (10 min). Blindaxe: aínda con moito volume, o nodo remata ben antes dos 900s do runner.
+const INICIO_DESCARGA = Date.now();
+const INTENTOS = 3;          // reintentos por paxina antes de desistir
+const TIMEOUT_MS = 120000;   // nunca baixar de 60000
 
-# Evita que se solapen dúas execucions do vixiante
-concurrency:
-  group: vixiante-n8n
-  cancel-in-progress: false
+const cpvInterese = ["92500","92521","98341","79992","63513","79311","79410","79411","72224","63514","79416","79500","98200","85312","80310","79950","79952","92000","79822","92511","79951","98133","73000","79418","79400"];
+// CPV "debiles": non abondan sos, esixen que o titulo toque unha palabra do noso nucleo.
+// (consultoria xenerica de xestion e asistencia social non piden ofertas do noso sector)
+const cpvDebil = ["85312","79411","79410","72224","79311","92000","73000","79400"];
+// Liña social que SI nos interesa dentro do 85312 (o resto -> fóra)
+const clavesSociais = ["violencia de xenero","violencia de genero","igualdade","igualdad","mocidade","xuventude","juventud","lgtbi","punto lila","punto violeta","violencia de genere","igualtat","joventut","punt lila","punt violeta"];
+const palabrasClave = ["biblioteca","arquivo","archivo","museo","conserjeria","conserxeria","porteria","portaria","recepcion","oficina de turismo","informacion turistica","punto de informacion","acogida turistica","auditorio","teatro","mocidade","xuventude","juventud","igualdade","igualdad","violencia de xenero","violencia de genero","exposicion","dinamizacion","sala de ensayo","salas de ensayo","control de acceso","apertura y cierre","juvenil","atencion al publico","acomodador","acomodacion","apoyo administrativo","administrativa y documental","gestion documental","arxiu","museu","consergeria","recepcio","oficina de turisme","informacio turistica","punt d'informacio","punt de informacio","acollida turistica","auditori","teatre","joventut","igualtat","violencia de genere","exposicio","dinamitzacio","sala d'assaig","sala de assaig","control d'acces","control de accessos","obertura i tancament","atencio al public","edificios municipales","edificis municipals","control administrativo","estudio de viabilidad","estudo de viabilidade","estudi de viabilitat","estudio previo","estudios previos","estudo previo","estudos previos","memoria de viabilidad","estudio economico-financiero","estudo economico-financeiro","plan economico-financiero","tiempo libre","tempo libre","temps lliure","ludoteca","ludoteques"];
+const vetoDuro = ["lavanderia","bar-cafeteria","cafeteria","catering","socorrismo","restaurante","comedor","reparto de alimentos","taurino","novillos","novillada","festejo","ternasco","suministro de ternasco","orquesta","actuacion musical","festival","concierto","obras de arte","obra artistica","anteproy","cortafuego","vigilancia","terapia ocupacional","discapacidad","situacion de dependencia","personas dependientes","atencion a la dependencia","ley de dependencia","residuos","agencia de viajes","navide","atracciones","centro de dia","atencion diurna","estancia diurna","tercera edad","ayuda a domicilio","proteccion de datos","delegado de proteccion","transporte para la exposicion","gala","auditoria externa","auditorias externas","desmontaje","streaming","retransmision","fiestas patronales","explotacion barra","plan funcional","programa de espacios","lirica","preparacion musical","sistemas de defensa","vandellos","encuesta","drones","actividades deportivas","flamenco","encuadernacion","maquetacion","supercargador","caseta municipal","escuela de teatro","muestra de teatro","libre concorrencia","stand del","feria internacional","fitur","fisioterapia","logopedia","nube privada","controlador de dominio","servidor de archivos","comidas a domicilio","atencion infantil temprana","escuela infantil","escola infantil","coctel","geofisica","climatizacion","aire acondicionado","exitus","dependientes o solas","proyecto museografico","palacio de congresos","impresion fotografica","servicio de impresion","impresion de","transporte de recogida","recogida y devolucion","reubicacion de los fondos","traslado y reubicacion","restauracion y consolidacion","piezas arqueologicas","produccion tecnica","son das festas","iluminacion e son","iluminacion y son","startups","starups","aceleradora","direccion facultativa","seguridad y salud","coordinacion de seguridad","reordenacion","diseno de la exposicion","diseno de exposicion","diseno museografico","barras de bar","barra de bar","autorizacion demanial","cartas postales","notificaciones postales","entrega a domicilio","menjar a casa","major a casa","autonomia personal","adicciones","grupo artistico","actuacion a cargo","de la compania","representacion de la obra","embalaje","rehabilitacion","proyecto de ejecucion","direccion de las obras","party food","casetas familiares","ambientaciones","decoraciones","montajes especiales","extincion de incendios","salvamento","esqui","pabellon","restauracion de","retablo","folclore","folklore","teleferico","instrumentos musicales","canto y baile","vulnerabilidad termica","calor extremo","sistemes urbans","pintura viaria","corrida de toros","plaza de toros","muntatge","desmuntatge","redaccion del proyecto","proyecto basico","excavacion","yacimiento","reforc educatiu","refuerzo educativo","centros de dia","servicio de transporte","servicios de transporte","transporte en autobus","transporte en turismos","transporte escolar","transporte sanitario","transporte adaptado","porteo","canto y voz","taller de canto","mercado medieval","feria medieval","montaje de exposiciones","produccion y montaje","conservacion del inmovilizado","direccion de obra","servei de transport","transport en autobus","transport escolar","transport sanitari","transport adaptat","direccio d'obra","direccio de les obres","direccio facultativa","seguretat i salut","orquestra","residus","taller de cant","cant i veu","mercat medieval","centre de dia","gent gran","festes patronals","festa major","stands de","ferias de turismo","feria de turismo","carga y descarga","sastreria","carrega i descarrega","fira de turisme","fires de turisme","cabalgata","cavalcada","arxiu passiu","archivo pasivo","destruccio","restaurant","desechos","concurso de proyectos","concurs de projectes","servicios de arquitectura","serveis d'arquitectura","cuentas anuales","comptes anuals","suministro de vestuario","ropa de trabajo","ascensores","ascensors","elevadores","elevadors","reciclado","papel y carton","recogida separada","embalatge","obres d'art","contra incendios","servicio de auditoria","servicios de auditoria","barraca","ganado","concesion demanial","tecnic d'escena","tecnico de escena","patrocinio","alojamiento de software","ahorro energetico","eficiencia energetica","eficiencias energeticas","mobiliario y enseres","traslado de documentacion","realizacion de la exposicion","realizacion de exposicion","edicion de libros","contraincendios","fotovoltaica","servicios graficos","missatgeria","paqueteria","mensajeria","espectaculos musicales","espectaculo musical","grabacion y emision","parc de nadal","salo infantil","reagrupament familiar","reagrupacion familiar","explotacion del bar","explotacion de bar","certificaciones energeticas","certificacion energetica","auditoria energetica","auditorias energeticas","experiencia museistica","experiencia inmersiva","asseguranca","multirisc","multirriesgo","alumbrado publico","projecte museologic","pla museologic","museografic","restauracion y conservacion de documentos","bus de nit","desenvolupament informatic","sage200","contra el llamp","parallamps","electriques","instalaciones electricas","red de seguridad","sistemas electronicos","reparacion de vidrio","levantamiento topografico","auditoria","cajas de documentos","exposicion artistica","riesgos laborales","control de aves","control de plagas","control de plagues","maquetacio","software como servicio","equipos informaticos","poliza de seguro","seguro de danos","reservas hoteleras","organizacion de viajes","transporte de las obras","traslado de bienes","intermediacion bancaria","peluqueria","maquillaje","anuncios preceptivos","mapa acustico","plan acustico"];
+// VETO AUGA (condicional): xestion/servizo real de auga -> fóra. PERO se o obxecto e un
+// ESTUDO/ASESORAMENTO previo a unha futura licitacion de auga (ver estudoPrevio), NON se veta:
+// eses interesan e van a prioritarias (caso Barbastro).
+const vetoAuga = ["clavegueram","aigua potable","agua potable","cicle integral de l'aigua","ciclo integral del agua","alcantarillado"];
+// ESTUDOS PREVIOS / DE VIABILIDADE / ASESORAMENTO sobre unha futura licitacion (auga e afins).
+// Interesan a Atlantic Ponte (consultoria de xestion) e mándanse SEMPRE a prioritarias.
+const estudoPrevio = ["estudio de viabilidad","estudo de viabilidade","estudi de viabilitat","estudio previo","estudos previos","estudios previos","estudo previo","asesoramiento en la elaboracion de los pliegos","asesoramiento en la elaboracion de pliegos","asistencia en la elaboracion de los pliegos","elaboracion de los pliegos","redaccion de los pliegos","redaccion de pliegos","estudio economico-financiero","estudio economico financiero","plan economico-financiero","memoria de viabilidad","estudo economico-financeiro"];
+const contextoAuga = ["agua potable","aigua potable","auga potable","abastecimiento de agua","abastecemento de auga","abastecimiento de aguas","saneamiento","saneamento","ciclo integral del agua","cicle integral de l'aigua","ciclo integral da auga","concesion de agua","concesion del servicio de agua","concesion de servicios de abastecimiento","concesion de servizos de abastecemento","alcantarillado","clavegueram","depuracion","aguas residuales"];
+const rescate = ["control de acceso","conserjeria","conserxeria","porteria","portaria","recepcion","control d'acces","control de accessos","consergeria","recepcio"];
+// VETO BRANDO: estas palabras vetan SALVO que o titulo mencione tamen un servizo do noso nucleo
+// (asi non perdemos lotes mixtos do tipo "conserxeria e limpeza").
+const vetoBrando = ["limpieza","desinfeccion","jardineria","viverismo","fumigacion","neteja","desinfeccio","fumigacio","viverisme"];
+const rescateBrando = ["control de acceso","conserjeria","conserxeria","porteria","portaria","recepcion","control d'acces","control de accessos","consergeria","recepcio"];
+const zonasPrioritarias = ["coruna","lugo","ourense","orense","pontevedra","valladolid","madrid","asturias","leon","galicia","santiago de compostela","compostela","vigo","ferrol","universidade de santiago","universidade de vigo","xunta de galicia"];
+// Seguridade/vixilancia por CPV: familias que non nos interesan nunca (79710/711/713/714/715).
+const cpvVetoSeguridade = ["79710","79711","79713","79714","79715"];
 
-jobs:
-  vixiar:
-    runs-on: ubuntu-latest
-    env:
-      N8N_URL: ${{ secrets.N8N_URL }}                    # ex.: https://primary-production-9f6e.up.railway.app/
-      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-      PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }}
-      GRAPHQL: "https://backboard.railway.com/graphql/v2"
-      ENV_NAME: "production"
-      PRIMARY_NAME: "Primary"
-      WORKER_NAME: "Worker"
-    steps:
-      - name: Comprobar e, se compre, reiniciar
-        run: |
-          set -uo pipefail
+const cpvTexto = {
+  "92500000":"Servicios de bibliotecas, archivos, museos y otros servicios culturales",
+  "92511000":"Servicios de bibliotecas","92521000":"Servicios de museos","92521100":"Servicios de exposicion de museos",
+  "92000000":"Servicios de esparcimiento, culturales y deportivos","98341130":"Servicios de conserjeria","98341120":"Servicios de porteria",
+  "79992000":"Servicios de recepcion","63513000":"Servicios de informacion turistica","63514000":"Servicios de guias de turismo",
+  "79410000":"Servicios de consultoria comercial y de gestion","79411000":"Servicios generales de consultoria en gestion",
+  "79400000":"Servicios de consultoria comercial y de gestion","79500000":"Servicios de ayuda en las funciones de oficina","80310000":"Servicios de ensenanza para jovenes",
+  "79950000":"Servicios de organizacion de exposiciones, ferias y congresos","79952000":"Servicios de eventos"
+};
 
-          # 1) Comprobar ata 3 veces (evita reiniciar por un ping solto).
-          #    "Caído" = non responde (000) ou erro de servidor (>=500, p.ex. o 503).
-          ok=0
-          code="000"
-          for i in 1 2 3; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "$N8N_URL" || echo "000")
-            echo "Comprobacion $i -> HTTP $code"
-            if [ "$code" != "000" ] && [ "$code" -lt 500 ] 2>/dev/null; then ok=1; break; fi
-            [ "$i" -lt 3 ] && sleep 15
-          done
+function normaliza(t){return (t||"").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"").trim();}
+function tag(texto,t){const m=texto.match(new RegExp("<"+t+"[^>]*>([\\s\\S]*?)<\\/"+t+">"));return m?m[1].trim():"";}
+function todosTag(texto,t){return (texto.match(new RegExp("<"+t+"[^>]*>[\\s\\S]*?<\\/"+t+">","g"))||[]).map(function(x){return x.replace(new RegExp("<\\/?"+t+"[^>]*>","g"),"").trim();});}
+function entre(texto,ini,fin){const i=texto.indexOf(ini);if(i===-1)return "";const j=texto.indexOf(fin,i+ini.length);if(j===-1)return "";return texto.substring(i+ini.length,j);}
+function normalizarImporte(imp){if(!imp)return "";var s=String(imp).replace(/[^0-9.,]/g,"");if(!s)return "";if(s.indexOf(",")!==-1){s=s.replace(/\./g,"").replace(",",".");}var n=parseFloat(s);if(isNaN(n))return "";return n.toFixed(2)+" EUR";}
+function limpiar(t){return (t||"").replace(/&amp;/g,"&").replace(/&lt;/g,"<").replace(/&gt;/g,">").replace(/&quot;/g,"\"").replace(/&#xD;/g," ").replace(/\s+/g," ").trim();}
+function capitaliza(t){return t?t.charAt(0).toUpperCase()+t.slice(1):t;}
 
-          if [ "$ok" = "1" ]; then
-            echo "OK: o n8n responde (HTTP $code). Nada que facer."
-            exit 0
-          fi
+function sacarNext(xml){const m=xml.match(/<link[^>]*rel="next"[^>]*>/);if(!m)return "";const h=m[0].match(/href="([^"]*)"/);return h?h[1]:"";}
+function updatedDe(entry){const m=entry.match(/<updated>([\s\S]*?)<\/updated>/);return m?new Date(m[1].trim()):null;}
+function esperar(ms){return new Promise(function(r){setTimeout(r,ms);});}
 
-          echo "AVISO: o n8n non responde (HTTP $code). Vou reinicialo en Railway."
+const dataHoxe = new Date().toLocaleDateString("gl-ES");
+const hoxe = new Date().toLocaleDateString("en-CA",{timeZone:"Europe/Madrid"});
+const limite = new Date(Date.now() - HORAS_VENTA*60*60*1000);
 
-          # 2) Descubrir os IDs (environment + servizos) a partir do PROJECT_ID.
-          Q='query project($id: String!){ project(id:$id){ environments{edges{node{id name}}} services{edges{node{id name}}} } }'
-          proj=$(jq -n --arg q "$Q" --arg id "$PROJECT_ID" '{query:$q,variables:{id:$id}}' \
-            | curl -s -X POST "$GRAPHQL" -H "Authorization: Bearer $RAILWAY_TOKEN" -H "Content-Type: application/json" -d @-)
+// Procesa unha entrada: devolve o obxecto final pequeno, ou null se non pasa o filtro
+function procesar(e){
+  const tipoCod = tag(entre(e,"<cac:ProcurementProject>","</cac:ProcurementProject>"),"cbc:TypeCode");
+  if (tipoCod==="1"||tipoCod==="3"||tipoCod==="31") return null;   // FILTRO 0: fora obras e subministracions
 
-          if echo "$proj" | jq -e '.errors' >/dev/null 2>&1; then
-            echo "ERRO consultando Railway (revisa o token/PROJECT_ID): $proj"; exit 1
-          fi
+  const titulo = limpiar(tag(e,"title"));
+  const tituloNorm = normaliza(titulo);
 
-          env_id=$(echo "$proj" | jq -r --arg n "$ENV_NAME" '.data.project.environments.edges[]|select(.node.name==$n)|.node.id')
-          primary_id=$(echo "$proj" | jq -r --arg n "$PRIMARY_NAME" '.data.project.services.edges[]|select(.node.name==$n)|.node.id')
-          worker_id=$(echo "$proj" | jq -r --arg n "$WORKER_NAME" '.data.project.services.edges[]|select(.node.name==$n)|.node.id')
+  // Caso especial: estudo/asesoramento previo a unha licitacion de auga -> interesa e vai a PRIORITARIA.
+  // Esixe as dúas cousas no titulo: (a) que sexa un estudo/asesoramento e (b) que o contexto sexa auga.
+  var esEstudoAugaPrioritario = estudoPrevio.some(function(k){return tituloNorm.indexOf(k)!==-1;}) &&
+                                contextoAuga.some(function(k){return tituloNorm.indexOf(k)!==-1;});
 
-          if [ -z "$env_id" ] || [ "$env_id" = "null" ] || [ -z "$primary_id" ] || [ "$primary_id" = "null" ]; then
-            echo "ERRO: non atopei os IDs. Revisa que ENV_NAME=production e os nomes Primary/Worker son correctos."
-            exit 1
-          fi
+  const cpvUnicos=[];
+  todosTag(e,"cbc:ItemClassificationCode").forEach(function(c){if(cpvUnicos.indexOf(c)===-1)cpvUnicos.push(c);});
+  const casaCPV = cpvUnicos.some(function(c){var p=c.substring(0,5);return cpvInterese.indexOf(p)!==-1 && cpvDebil.indexOf(p)===-1;});
+  const casaPalabra = palabrasClave.some(function(k){return tituloNorm.indexOf(k)!==-1;}) || clavesSociais.some(function(k){return tituloNorm.indexOf(k)!==-1;});
+  if (!casaCPV && !casaPalabra && !esEstudoAugaPrioritario) return null;
+  // 85312 (asistencia social): so entra pola liña social (violencia/igualdade/mocidade)
+  var ten85312 = cpvUnicos.some(function(c){return c.substring(0,5)==="85312";});
+  if (ten85312 && !casaCPV && !clavesSociais.some(function(k){return tituloNorm.indexOf(k)!==-1;})) return null;
 
-          # 3) Reiniciar (redeploy) Primary e Worker.
-          redeploy () {
-            sid="$1"; nome="$2"
-            if [ -z "$sid" ] || [ "$sid" = "null" ]; then echo "Salto $nome (sen id)"; return 0; fi
-            payload=$(jq -n --arg s "$sid" --arg e "$env_id" \
-              '{query:"mutation r($s:String!,$e:String!){serviceInstanceRedeploy(serviceId:$s,environmentId:$e)}",variables:{s:$s,e:$e}}')
-            resp=$(curl -s -X POST "$GRAPHQL" -H "Authorization: Bearer $RAILWAY_TOKEN" -H "Content-Type: application/json" -d "$payload")
-            if echo "$resp" | jq -e '.errors' >/dev/null 2>&1; then
-              echo "ERRO ao reiniciar $nome: $resp"
-            else
-              echo "OK: reinicio de $nome disparado."
-            fi
-          }
+  // Seguridade/vixilancia por CPV: se leva un CPV de seguridade e non ten CPV forte de
+  // interese nin un servizo do noso nucleo no titulo, fora (ex.: "seguridad del museo").
+  var tenSeguridade = cpvUnicos.some(function(c){return cpvVetoSeguridade.indexOf(c.substring(0,5))!==-1;});
+  if (tenSeguridade && !casaCPV && !rescate.some(function(r){return tituloNorm.indexOf(r)!==-1;})) return null;
 
-          redeploy "$primary_id" "Primary"
-          redeploy "$worker_id" "Worker"
-          echo "Feito. O n8n debería volver responder nun par de minutos."
+  if (vetoDuro.some(function(v){return tituloNorm.indexOf(v)!==-1;})) return null;
+  if (!esEstudoAugaPrioritario && vetoAuga.some(function(v){return tituloNorm.indexOf(v)!==-1;})) return null;
+  if (tituloNorm.indexOf("piscina")!==-1 && !rescate.some(function(r){return tituloNorm.indexOf(r)!==-1;})) return null;
+  if (vetoBrando.some(function(v){return tituloNorm.indexOf(v)!==-1;}) &&
+      !rescateBrando.some(function(r){return tituloNorm.indexOf(r)!==-1;})) return null;
+
+  // ---- Datos do summary (organo, importe, id) ----
+  const summary = tag(e,"summary");
+  let organo="",importe="",idLic="";
+  summary.split(";").forEach(function(p){p=p.trim();
+    if(p.indexOf("Órgano de Contratación:")===0)organo=p.replace("Órgano de Contratación:","").trim();
+    if(p.indexOf("Importe:")===0)importe=normalizarImporte(p.replace("Importe:","").trim());
+    if(p.indexOf("Id licitación:")===0)idLic=p.replace("Id licitación:","").trim();});
+
+  // ---- PECHE ESTADO/PRAZO (versión suave): so tira o que está pechado ou vencido ----
+  // Mantense se a data de prazo falta (para non perder licitacions boas con feed incompleto).
+  const estadoCod = tag(e,"cbc-place-ext:ContractFolderStatusCode");
+  const awardDate = tag(e,"cbc:AwardDate");
+  const prazoData = tag(entre(e,"<cac:TenderSubmissionDeadlinePeriod>","</cac:TenderSubmissionDeadlinePeriod>"),"cbc:EndDate");
+  const prazoHora = tag(entre(e,"<cac:TenderSubmissionDeadlinePeriod>","</cac:TenderSubmissionDeadlinePeriod>"),"cbc:EndTime");
+  const pechada = (estadoCod==="RES" || estadoCod==="ADJ" || !!awardDate || (prazoData && prazoData < hoxe));
+  if (pechada) return null;
+
+  // ---- Provincia + clasificacion prioritaria (con fallback ao organo se o lugar é xenérico) ----
+  const provinciaRaw = tag(entre(e,"<cac:RealizedLocation>","</cac:RealizedLocation>"),"cbc:CountrySubentity");
+  const provinciaNorm = normaliza(provinciaRaw);
+  let baseLoc = provinciaNorm;
+  if (!baseLoc || baseLoc==="espana") baseLoc = normaliza(organo);   // fallback: deducir zona do organo
+  const zonaMatch = zonasPrioritarias.find(function(z){return baseLoc.indexOf(z)!==-1;});
+  let prioritaria = zonaMatch ? "Si" : "Non";
+  if (esEstudoAugaPrioritario) prioritaria = "Si";   // estudos previos de auga: sempre prioritarios
+  let provinciaDisplay = provinciaRaw || "—";
+  const cidadesGalegas = ["santiago de compostela","compostela","vigo","ferrol","universidade de santiago","universidade de vigo","xunta de galicia"];
+  if ((!provinciaNorm || provinciaNorm==="espana") && zonaMatch) {
+    provinciaDisplay = (cidadesGalegas.indexOf(zonaMatch)!==-1) ? "Galicia" : capitaliza(zonaMatch);
+  }
+
+  let url="";const ml=e.match(/<link\s+href="([^"]*)"/);if(ml)url=limpiar(ml[1]);
+
+  let dataLimite="—";
+  if(prazoData){const pd=prazoData.split("-");dataLimite=(pd.length===3)?(pd[2]+"/"+pd[1]+"/"+pd[0]):prazoData;if(prazoHora)dataLimite=dataLimite+" "+prazoHora.substring(0,5);}
+
+  let cpvFmt=cpvUnicos.map(function(c){return cpvTexto[c]?(c+"-"+cpvTexto[c]+"."):c;}).join(", ");
+  if(!cpvFmt)cpvFmt="—";
+
+  return {
+    data: dataHoxe,
+    categoria: "nacional",
+    titulo: titulo,
+    organo: organo,
+    importe: importe,
+    idLicitacion: idLic,
+    cpv: cpvFmt,
+    provincia: provinciaDisplay,
+    dataLimite: dataLimite,
+    prioritaria: prioritaria,
+    url: url
+  };
+
+}
+
+// Baixa unha paxina con reintentos
+const baixar = async (u) => {
+  let ultimoErro = null;
+  for (let intento = 1; intento <= INTENTOS; intento++) {
+    try {
+      return await this.helpers.httpRequest({ method:"GET", url:u, json:false, timeout:TIMEOUT_MS });
+    } catch (err) {
+      ultimoErro = err;
+      if (intento < INTENTOS) await esperar(2000 * intento);
+    }
+  }
+  throw ultimoErro;
+};
+
+// Baixa e filtra un feed enteiro (paxinando ata cubrir 24h). Devolve resultados + diagnostico.
+async function baixarFeed(urlInicial) {
+  let url = urlInicial, paxinas = 0, entradas24h = 0, entradasTotais = 0, parouPorData = false, parouPorTempo = false;
+  let maisVella = null;   // updated mais antigo alcanzado (diagnostico de cobertura)
+  const salida = [];
+  for (let i = 0; i < MAX_PAXINAS; i++) {
+    // TEITO DE TEMPO: se levamos xa moito descargando, paramos e seguimos co que temos.
+    // A memoria anti-repeticion recupera o que quede fora na tirada do dia seguinte.
+    if (Date.now() - INICIO_DESCARGA > MAX_MS_DESCARGA) { parouPorTempo = true; break; }
+    let xml;
+    try { xml = await baixar(url); }
+    catch (err) {
+      if (paxinas === 0) throw new Error("Feed non responde tras " + INTENTOS + " intentos: " + (err && err.message ? err.message : err));
+      break;
+    }
+    paxinas++;
+    const entradas = xml.match(/<entry\b[\s\S]*?<\/entry>/g) || [];
+    entradasTotais += entradas.length;
+    const next = sacarNext(xml);
+    xml = null;
+    let frescasNaPaxina = 0;
+    for (const e of entradas) {
+      const u = updatedDe(e);
+      if (u && (!maisVella || u < maisVella)) maisVella = u;
+      if (u && u >= limite) { frescasNaPaxina++; entradas24h++; const obj = procesar(e); if (obj) salida.push({ json: obj }); }
+    }
+    // PARAR so cando unha paxina ENTEIRA queda fora da xanela de 24h.
+    // (Antes paraba na primeira entrada vella; o feed da PLACSP NON sempre ven ordenado por
+    //  <updated>, e unha soa entrada desordenada cortaba a descarga -> perdianse licitacions
+    //  posteriores da mesma xanela. Agora toleramos o desorde dentro dunha paxina.)
+    if (frescasNaPaxina === 0) { parouPorData = true; break; }
+    if (!next) break;
+    url = next;
+    await esperar(PAUSA_MS);
+  }
+  return { salida: salida, paxinas: paxinas, entradas24h: entradas24h, entradasTotais: entradasTotais, parouPorData: parouPorData, parouPorTempo: parouPorTempo, maisVella: maisVella };
+}
+
+// 1) Feed NACIONAL (obrigatorio): se cae por completo, a execucion falla en vermello.
+const nac = await baixarFeed(URL_NACIONAL);
+if (nac.paxinas > 0 && nac.entradasTotais === 0) {
+  throw new Error("PLACSP nacional devolveu feed baleiro: probable caida/mantemento do servidor de sindicacion.");
+}
+
+// 2) Feed AGREGADAS (autonomicas). A proba de fallos: se cae, seguimos SO coas nacionais.
+let agr = { salida: [], paxinas: 0, entradas24h: 0, entradasTotais: 0 };
+try {
+  agr = await baixarFeed(URL_AGREGADAS);
+} catch (err) {
+  console.log("AVISO: feed de agregadas non dispoñible, seguimos coas nacionais. " + (err && err.message ? err.message : err));
+}
+
+// Combinar as dúas fontes e deduplicar por URL/id
+let salida = nac.salida.concat(agr.salida);
+const vistos = {};
+salida = salida.filter(function(it){
+  const clave = it.json.url || it.json.idLicitacion || it.json.titulo;
+  if (vistos[clave]) return false;
+  vistos[clave] = true;
+  return true;
+});
+
+console.log("NACIONAL -> pax:" + nac.paxinas + " filtradas:" + nac.salida.length +
+            " (cobertura ata " + (nac.maisVella ? nac.maisVella.toISOString() : "?") + ")" +
+            " | AGREGADAS -> pax:" + agr.paxinas + " filtradas:" + agr.salida.length +
+            " (cobertura ata " + (agr.maisVella ? agr.maisVella.toISOString() : "?") + ")" +
+            " | TOTAL (sen duplicados na tirada):" + salida.length +
+            ((nac.parouPorTempo || agr.parouPorTempo) ? " | AVISO: parouse por TEITO DE TEMPO (o resto recuperarase mañá)" : ""));
+
+// NOTA: quitouse a "memoria anti-repeticion" do feed estatal. Aquela peza podia suprimir
+// TODAS as licitacions se o seu almacen quedaba envelenado (dias con 0 en silencio).
+// Volvemos ao comportamento simple e probado: xanela de 24h + deduplicacion SO dentro da
+// tirada (vistos, arriba). Cada dia a xanela de 24h non solapa, asi que non hai duplicados.
+
+// Se non hai nada relevante (pero os feeds funcionaron), marcador baleiro para enviar email igual
+if (salida.length === 0) {
+  salida.push({ json: { categoria: "baleiro", titulo: "" } });
+}
+
+salida.sort(function(a,b){if(a.json.prioritaria===b.json.prioritaria)return 0;return a.json.prioritaria==="Si"?-1:1;});
+
+return salida;
